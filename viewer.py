@@ -5,6 +5,7 @@ import numpy as np
 import plotly.graph_objects as go
 import math
 from dash import Dash, dcc, html, Output, Input
+from kalman import AircraftKF
 
 SNAP_ROOT = "./snapshots"  # same folder as the writer
 KT_TO_MPS  = 0.514444
@@ -39,13 +40,12 @@ def forward_point(lat_deg, lon_deg, speed_kt, track_deg, dt_s, alt_ft, vert_rate
 
     return math.degrees(lat2), math.degrees(lon2), alt2_ft
 
-def predicted_tracks_over_time(df: pd.DataFrame, horizon_s=15.0, use_vert_rate=True, kf_lookup=None):
+def predicted_tracks_over_time(df: pd.DataFrame, horizon_s=15.0) -> pd.DataFrame:
     """
-    For each aircraft and each real sample at time t, compute a prediction at t+horizon_s.
-    Returns a DataFrame with one row per *prediction*:
-      name, t_rx (source time), t_pred (prediction time),
-      pred_lat, pred_lon, pred_alt_ft
-    If kf_lookup is provided (dict name -> AircraftKF), uses its predict_next().
+    Kalman-based predictions:
+    For each aircraft and each real sample at time t, update a per-aircraft AircraftKF
+    and emit a prediction for time t + horizon_s.
+    Returns columns: [name, t_rx, t_pred, pred_lat, pred_lon, pred_alt_ft]
     """
     if df.empty:
         return pd.DataFrame(columns=["name","t_rx","t_pred","pred_lat","pred_lon","pred_alt_ft"])
@@ -57,40 +57,53 @@ def predicted_tracks_over_time(df: pd.DataFrame, horizon_s=15.0, use_vert_rate=T
 
     rows = []
     for name, g in d.groupby("name", sort=False):
+        kf = AircraftKF()
         for _, r in g.iterrows():
-            # choose kinematics source
-            spd_kt   = r.get("speed")
-            trackdeg = r.get("track")
-            alt_ft   = r.get("altitude")
-            alt_override = None
+            t_meas = float(r["t_rx"])
+            alt_ft = r.get("altitude")
+            spd_kt = r.get("speed")
+            trk_deg = r.get("track")
+            vr_fpm = r.get("vert_rate")
 
-            # If you have a Kalman filter per aircraft, use it for the horizon prediction
-            if kf_lookup and name in kf_lookup:
-                alt_p, spd_p, trk_p = kf_lookup[name].predict_next(horizon_s)
-                if alt_p is not None:   alt_override = alt_p
-                if spd_p is not None:   spd_kt = spd_p
-                if trk_p is not None:   trackdeg = trk_p
+            # Update KF with whatever measurements are present at this time
+            kf.update(
+                t_meas=t_meas,
+                altitude_ft=alt_ft,
+                speed_kt=spd_kt,
+                track_deg=trk_deg,
+                vert_rate_fpm=vr_fpm,
+            )
+
+            # Predict ahead by the horizon
+            alt_p_ft, spd_p_kt, trk_p_deg = kf.predict_next(dt_ahead=horizon_s)
+
+            # Fall back to raw kinematics if KF hasn't stabilized yet
+            use_spd = spd_p_kt if spd_p_kt is not None else spd_kt
+            use_trk = trk_p_deg if trk_p_deg is not None else trk_deg
 
             lat2, lon2, alt2 = forward_point(
-                lat_deg=r["lat"], lon_deg=r["lon"],
-                speed_kt=spd_kt, track_deg=trackdeg,
+                lat_deg=r["lat"],
+                lon_deg=r["lon"],
+                speed_kt=use_spd,
+                track_deg=use_trk,
                 dt_s=horizon_s,
                 alt_ft=alt_ft,
-                vert_rate_fpm=(r.get("vert_rate") if use_vert_rate else None),
-                alt_override_ft=alt_override
+                vert_rate_fpm=None,
+                alt_override_ft=alt_p_ft
             )
             if lat2 is None:
                 continue
+
             rows.append({
                 "name": name,
-                "t_rx": float(r["t_rx"]),
-                "t_pred": float(r["t_rx"]) + float(horizon_s),
+                "t_rx": t_meas,
+                "t_pred": t_meas + float(horizon_s),
                 "pred_lat": lat2,
                 "pred_lon": lon2,
                 "pred_alt_ft": alt2
             })
-    pred = pd.DataFrame(rows)
-    return pred
+
+    return pd.DataFrame(rows)
 
 def prediction_errors(df_real: pd.DataFrame, df_pred: pd.DataFrame, max_dt_s=3.0):
     # prepare real with time index per aircraft
@@ -130,61 +143,6 @@ def prediction_errors(df_real: pd.DataFrame, df_pred: pd.DataFrame, max_dt_s=3.0
             })
     return pd.DataFrame(errs)
 
-def latest_predictions(df, horizon_s=15.0, use_vert_rate=True, kf_lookup=None):
-    """
-    For each aircraft, take its latest row and produce one predicted point horizon_s seconds ahead.
-    If kf_lookup is provided (dict name->AircraftKF), it will use KF predictions for (speed, track, alt).
-    Returns DataFrame with: name, lat, lon, alt_ft, pred_lat, pred_lon, pred_alt_ft
-    """
-    if df.empty:
-        return pd.DataFrame(columns=["name","lat","lon","alt_ft","pred_lat","pred_lon","pred_alt_ft"])
-
-    d = df.dropna(subset=["lat","lon"]).copy()
-    d["name"] = d["flight"].fillna("").str.strip()
-    d.loc[d["name"].eq(""), "name"] = d["hex"].fillna("UNKNOWN")
-
-    idx = d.groupby("name", sort=False)["t_rx"].idxmax()
-    g   = d.loc[idx, ["name","lat","lon","altitude","speed","track","vert_rate"]].copy()
-
-    rows = []
-    for _, r in g.iterrows():
-        # default: raw kinematics
-        spd_kt   = r.get("speed")
-        trackdeg = r.get("track")
-        alt_ft   = r.get("altitude")
-        alt_override = None
-
-        # if you have a Kalman filter, override the kinematics here:
-        if kf_lookup and r["name"] in kf_lookup:
-            alt_pred_ft, spd_pred_kt, track_pred_deg = kf_lookup[r["name"]].predict_next(horizon_s)
-            if alt_pred_ft is not None:
-                alt_override = alt_pred_ft
-            if spd_pred_kt is not None:
-                spd_kt = spd_pred_kt
-            if track_pred_deg is not None:
-                trackdeg = track_pred_deg
-
-        lat2, lon2, alt2 = forward_point(
-            lat_deg=r["lat"],
-            lon_deg=r["lon"],
-            speed_kt=spd_kt,
-            track_deg=trackdeg,
-            dt_s=horizon_s,
-            alt_ft=alt_ft,
-            vert_rate_fpm=(r.get("vert_rate") if use_vert_rate else None),
-            alt_override_ft=alt_override
-        )
-        if lat2 is None:  # missing inputs
-            continue
-
-        rows.append({
-            "name": r["name"],
-            "lat": r["lat"], "lon": r["lon"], "alt_ft": alt_ft,
-            "pred_lat": lat2, "pred_lon": lon2, "pred_alt_ft": alt2
-        })
-
-    return pd.DataFrame(rows)
-
 def build_fig(df: pd.DataFrame, horizon_s=15.0):
     # --- Actual tracks ---
     traces = []
@@ -218,28 +176,28 @@ def build_fig(df: pd.DataFrame, horizon_s=15.0):
             )
         ))
 
-    # --- Predicted tracks over time ---
-    pred = predicted_tracks_over_time(df, horizon_s=horizon_s, use_vert_rate=True, kf_lookup=None)
+    # --- Predicted tracks over time (Kalman) ---
+    pred = predicted_tracks_over_time(df, horizon_s=horizon_s)
     if not pred.empty:
-        # order each predicted series by prediction time (t_pred)
         for name, g in pred.groupby("name", sort=False):
-            g = g.sort_values("t_pred")
+            g = g.sort_values("t_pred").reset_index(drop=True)
+            # pretty local timestamp for hover
+            t_pred_local = pd.to_datetime(g["t_pred"], unit="s", utc=True).dt.tz_convert("America/Los_Angeles").dt.strftime("%Y-%m-%d %H:%M:%S %Z")
             custom = np.column_stack([
                 g["name"].astype(str),
                 g["pred_alt_ft"].astype(float),
-                g["t_pred"].astype(str),
+                t_pred_local.astype(str),
             ])
             traces.append(go.Scatter3d(
                 x=g["pred_lon"], y=g["pred_lat"], z=g["pred_alt_ft"],
-                mode="lines+markers",
-                marker=dict(size=2),
+                mode="lines",
                 name=f"{name} (pred)",
-                line=dict(width=4),
+                line=dict(width=3),
                 customdata=custom,
                 hovertemplate=(
                     "Flight: %{customdata[0]}<br>"
                     "Pred. Alt: %{customdata[1]} ft<br>"
-                    "Pred. Time: %{customdata[3]}<extra></extra>"
+                    "Pred. Time: %{customdata[2]}<extra></extra>"
                 )
             ))
 
@@ -252,7 +210,7 @@ def build_fig(df: pd.DataFrame, horizon_s=15.0):
         ),
         margin=dict(l=0,r=0,t=30,b=0),
         showlegend=True,
-        title=f"Actual vs Predicted Tracks (+{int(horizon_s)}s)",
+        title=f"Actual vs Predicted Tracks (+{int(horizon_s)}s, Kalman)",
         uirevision="stay"
     )
     return fig
